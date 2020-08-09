@@ -1,0 +1,28 @@
+#!/bin/sh
+
+readonly INITRD_PATH="$2"
+
+# Only run if we are configuring a initramfs
+if [ -n "$DEB_MAINT_PARAMS" ]; then
+	eval set -- "$DEB_MAINT_PARAMS"
+
+	if [ -z "$1" ] || [ "$1" != 'configure' ]; then
+		exit 0
+	fi
+fi
+
+# Execute and import common logic
+# shellcheck source=../../../usr/lib/uefi-boot-helper/uefi-boot-helper-common
+. /usr/lib/uefi-boot-helper/uefi-boot-helper-common
+
+# Create the OS vendor directory
+make_vendor_directory
+
+# Just copy the kernel initrd to its final location
+if [ -f "$INITRD_PATH" ]; then
+	if ! cp "$INITRD_PATH" "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY/INITRD.IMG" 2>/dev/null; then
+		echo 'E: update-uefi-boot: could not install the new initrd to the ESP. Is it full?' >&2
+		exit 1
+	fi
+	chmod 660 "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY/INITRD.IMG" 2>/dev/null || true
+fi

@@ -1,0 +1,17 @@
+Package: uefi-boot-helper
+Version: 1.0.0-1
+Section: admin
+Priority: important
+Architecture: all
+Depends: efibootmgr, gzip (>= 1.0), gzip (<< 2.0)
+Enhances: linux-image, initramfs-tools
+Maintainer: Alejandro González <alejandro.gonzalez.correo@gmail.com>
+Description: Kernel image and initramfs hooks for updating the ESP and EFI boot entries
+ This package maintains the EFI system partition and EFI boot manager entries updated
+ whenever a new kernel image package is installed or a new initial ramdisk is generated,
+ so that the UEFI boot manager always tries to boot the latest installed kernel and
+ ramdisk first.
+ .
+ If you remove this package, the UEFI boot manager and ESP contents will no longer be
+ updated automatically, which may lead to booting previous versions of the kernel and
+ the initial ramdisk.

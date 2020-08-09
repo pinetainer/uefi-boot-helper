@@ -1,0 +1,1 @@
+root=LABEL=UBUNTUROOTFS initrd=\EFI\PCNTUBTU\INITRD.IMG elevator=noop

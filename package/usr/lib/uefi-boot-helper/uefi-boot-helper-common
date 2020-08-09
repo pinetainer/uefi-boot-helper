@@ -1,0 +1,68 @@
+#!/bin/sh
+
+## Configurable constants ##
+
+# The filesystem and partition label that will be used to
+# identify the ESP.
+export readonly ESP_LABEL='ESP'
+
+# The name of the UEFI boot entry label that this helper
+# manages.
+export readonly UEFI_BOOT_ENTRY_LABEL='Ubuntu'
+
+# The name of the vendor directory in the ESP that this
+# helper manages.
+export readonly ESP_VENDOR_DIRECTORY='PCNTUBTU'
+
+# The text file which contains the kernel boot parameters
+# that the UEFI boot manager will pass on to the kernel,
+# verbatim. The text will be stored in NVRAM with the UCS-2
+# encoding mandated by the UEFI specification.
+export readonly KERNEL_BOOT_PARAMETERS_FILE='/etc/kernel-cmdline'
+
+## End of configurable constants ##
+
+# Retrieves a candidate ESP mount path, by finding a mounted
+# filesystem which can be identified as a ESP, or looking at
+# the /etc/fstab file. If a candidate path was not found, the
+# default /boot/efi path is returned.
+get_tentative_esp_mount_path() {
+	esp_mount_path="$(findmnt -fn -o TARGET -S LABEL=$ESP_LABEL)"
+	esp_mount_path="${ESP_MOUNT_PATH:-$(findmnt -fn -o TARGET -S PARTLABEL=$ESP_LABEL)}"
+	esp_mount_path="${ESP_MOUNT_PATH:-/boot/efi}"
+
+	echo "$esp_mount_path"
+}
+
+# Find the ESP mount path. This function tries to mount it if necessary.
+# On success, the ESP mount path is shown on the standard output.
+# On failure, an error code is returned.
+find_esp_mount_path() {
+	tries=0
+
+	esp_mount_path="$(get_tentative_esp_mount_path)"
+	while [ $tries -lt 2 ] && ! mountpoint -q "$esp_mount_path"; do
+		mount -L "$ESP_LABEL" >/dev/null 2>&1
+		esp_mount_path="$(get_tentative_esp_mount_path)"
+		tries=$((tries += 1))
+	done
+
+	mountpoint -q "$esp_mount_path" && echo "$esp_mount_path"
+}
+
+# Creates an appropriate OS vendor directory, according to section 13.3.1.3
+# of the UEFI Specification, Version 2.7 Errata B. If the directory is already
+# present, this function does nothing.
+# On failure, an error code is returned.
+make_vendor_directory() {
+	mkdir -p "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY" 2>/dev/null && \
+	chmod 770 "$ESP_MOUNT_PATH/EFI" "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY" 2>/dev/null
+}
+
+# Find the ESP mount path
+if ! ESP_MOUNT_PATH="$(find_esp_mount_path)"; then
+	echo 'E: update-uefi-boot: the ESP was not found. The changes will not be visible to the UEFI boot manager' >&2
+	exit 76
+fi
+
+export ESP_MOUNT_PATH

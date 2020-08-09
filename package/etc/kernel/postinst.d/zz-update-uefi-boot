@@ -1,0 +1,151 @@
+#!/bin/sh
+
+readonly KERNEL_VERSION="$1"
+readonly KERNEL_IMAGE_PATH="${2:-/boot/vmlinuz-$KERNEL_VERSION}"
+
+# Only run if we are configuring a kernel
+if [ -n "$DEB_MAINT_PARAMS" ]; then
+	eval set -- "$DEB_MAINT_PARAMS"
+
+	if [ -z "$1" ] || [ "$1" != 'configure' ]; then
+		exit 0
+	fi
+fi
+
+# Be safe and bail out in case we don't know the kernel version
+if [ -z "$KERNEL_VERSION" ]; then
+	echo "E: update-uefi-boot: ${DPKG_MAINTSCRIPT_PACKAGE:-kernel package} did not pass a kernel version" >&2
+	exit 1
+fi
+
+# Checks whether efibootmgr is available, and if so runs it with the
+# specified parameters. Otherwise, prints an error and exits the script.
+run_efibootmgr() {
+	if ! command -v efibootmgr >/dev/null 2>&1; then
+		echo 'E: update-uefi-boot: efibootmgr is required to manipulate UEFI boot variables, but it was not found' >&2
+		exit 75
+	fi
+
+	# Try to load the efivars module, just in case it was not
+	# loaded yet, so efibootmgr can work. This may fail for
+	# several reasons, but ignore the failure for now and run
+	# efibootmgr anyway
+	modprobe -sq efivars 2>/dev/null
+
+	efibootmgr "$@" 2>/dev/null
+}
+
+# Deletes the temporary vmlinux executable generated
+# by this script. This function always succeeds and
+# prints nothing.
+delete_temporary_vmlinux() {
+	if [ -n "$delete_temp_vmlinux" ]; then
+		rm "$temp_vmlinux" >/dev/null 2>&1
+	fi
+
+	return 0
+}
+
+# Execute and import common logic
+# shellcheck source=../../../usr/lib/uefi-boot-helper/uefi-boot-helper-common
+. /usr/lib/uefi-boot-helper/uefi-boot-helper-common
+
+# Get the (hopefully) canonical device file for the ESP, under /dev
+esp_device_file="$(findmnt -fn -o SOURCE -T "$ESP_MOUNT_PATH")"
+
+# Assert that esp_device begins with /dev/
+relative_esp_device_path="${esp_device_file#/dev/}"
+if [ "${#esp_device_file}" -eq "${#relative_esp_device_path}" ]; then
+	echo 'E: update-uefi-boot: the ESP device file was not found. The changes will not be visible to the UEFI boot manager' >&2
+	exit 2
+fi
+
+# If the kernel was compressed with gzip, uncompress it and use the
+# result as a candidate to put on the ESP vendor directory.
+# If it was not, then try to use the executable directly
+if gzip -l "$KERNEL_IMAGE_PATH" >/dev/null 2>&1; then
+	temp_vmlinux="$(mktemp --tmpdir 'vmlinuxXXX')"
+	delete_temp_vmlinux=1
+	gzip -c -d "$KERNEL_IMAGE_PATH" >"$temp_vmlinux" 2>/dev/null
+else
+	temp_vmlinux="$KERNEL_IMAGE_PATH"
+fi
+
+# Get the first two bytes of the executable to check if it is
+# a kernel with a EFI stub, which follows the PE/COFF executable
+# format, and therefore has a MS-DOS stub executable inside.
+# If it has a stub, we are fine. If not, abort, as the executable
+# would not be able to be booted by UEFI anyway
+if [ "$(dd if="$temp_vmlinux" bs=2 count=1 2>/dev/null)" != 'MZ' ]; then
+	echo "E: update-uefi-boot: $KERNEL_IMAGE_PATH is not a kernel executable with a EFI stub, so it cannot be booted by the UEFI boot manager" >&2
+
+	exit 3
+fi
+
+# Create the OS vendor directory
+make_vendor_directory
+
+# Now copy the kernel executable to its final location
+if ! cp "$temp_vmlinux" "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY/VMLINUX.EFI" 2>/dev/null; then
+	echo 'E: update-uefi-boot: could not install the new kernel executable to the ESP. Is it full?' >&2
+
+	delete_temporary_vmlinux
+	exit 4
+fi
+delete_temporary_vmlinux
+chmod 660 "$ESP_MOUNT_PATH/EFI/$ESP_VENDOR_DIRECTORY/VMLINUX.EFI" 2>/dev/null
+
+# Get the partition number of the ESP, assuming that the concatenation
+# of numbers in the device file basename equals the partition number.
+# This is the case for GPT partitions in SCSI and virtio block devices
+esp_disk_partition_number="$(printf '%s' "${esp_device_file##*/}" | tr -cd 0-9)"
+
+# Now get the disk device file, without the partition. Again, we assume
+# the same naming scheme that we used for computing the partition number
+esp_disk_device_file_name="$(printf '%s' "${esp_device_file##*/}" | tr -d 0-9)"
+esp_disk_device_file="${esp_device_file%/*}/$esp_disk_device_file_name"
+
+# Get the kernel command line parameters to put in the to be created
+# UEFI boot entry
+kernel_cmdline="$(cat $KERNEL_BOOT_PARAMETERS_FILE 2>/dev/null)"
+if [ -z "$kernel_cmdline" ]; then
+	echo "W: update-uefi-boot: read empty or missing kernel command line parameters from $KERNEL_BOOT_PARAMETERS_FILE. Falling back to /proc/cmdline" >&2
+	kernel_cmdline="$(cat /proc/cmdline 2>/dev/null)"
+
+	if [ -z "$kernel_cmdline" ]; then
+		echo "E: update-uefi-boot: could not get the kernel command line parameters from /proc/cmdline. Is /proc mounted?" >&2
+		exit 5
+	fi
+fi
+
+# Get the matching UEFI boot entries for our OS, if any exists.
+# Under normal circumstances, only a single entry would match,
+# but we want this script to be extremely lenient and robust
+uefi_boot_entries="$(run_efibootmgr | grep -Ex "Boot[0-9A-Fa-f]{4}[* ] $UEFI_BOOT_ENTRY_LABEL")"
+
+# Delete the matching entries
+echo "$uefi_boot_entries" | while read -r uefi_boot_entry; do
+	# Get the NVMEM variable name
+	nvmem_variable="${uefi_boot_entry%% *}"
+	nvmem_variable="${nvmem_variable%"*"}"
+
+	# The UEFI specification guarantees that the variable name is like BootXXXX,
+	# where XXXX is a hexadecimal integer. Therefore, to get the boot entry number,
+	# we just need to strip the "Boot" prefix
+	boot_entry_number="${nvmem_variable#Boot}"
+
+	# Delete the entry. Leaving old variables behind is not critical, but the
+	# user should know that nevertheless, so he/she can fix that and know why
+	# there are so many boot entries
+	if ! run_efibootmgr -b "$boot_entry_number" -B >/dev/null; then
+		echo "W: update-uefi-boot: The old $nvmem_variable UEFI NVMEM variable could not be deleted. This should not happen, but continuing anyway." >&2
+	fi
+done
+
+# Add the updated entry. efibootmgr will update BootOrder so the new entry goes first
+if ! run_efibootmgr -c --disk "$esp_disk_device_file" --part "$esp_disk_partition_number" \
+--label "$UEFI_BOOT_ENTRY_LABEL" --loader "/EFI/$ESP_VENDOR_DIRECTORY/VMLINUX.EFI" -u "$kernel_cmdline"
+then
+	echo "E: update-uefi-boot: could not add the new UEFI boot entry. The UEFI boot manager may not boot this OS anymore. Please review and fix this manually ASAP" >&2
+	exit 6
+fi
